@@ -134,10 +134,11 @@ struct size_class **build_pool(int delta, int (*chain_func)(int))
 	struct size_class **pool = calloc(num_classes, sizeof(struct size_class *));
 	struct size_class *prev_class = NULL;
 
+	num_classes -= 1;
 	printf("\nBuilding Pool: Delta=%d, NumClasses=%d\n", delta, num_classes);
 
 	// Iterate reversely
-	for (i = num_classes - 1; i >= 0; i--) {
+	for (i = num_classes; i >= 0; i--) {
 		int size;
 		int pages_per_zspage;
 		int objs_per_zspage;
