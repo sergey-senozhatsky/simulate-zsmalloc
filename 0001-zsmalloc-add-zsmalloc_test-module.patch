@@ -1,0 +1,200 @@
+From 627fcab290f5de2963270c03c8dfd34532d9e938 Mon Sep 17 00:00:00 2001
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Date: Tue, 30 Dec 2025 21:19:42 +0900
+Subject: [PATCH] zsmalloc: add zsmalloc_test module
+
+A simple module to generate byte-to-byte comparable
+zsmalloc workloads.
+
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+---
+ mm/Makefile        |   1 +
+ mm/zsmalloc_test.c | 164 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 165 insertions(+)
+ create mode 100644 mm/zsmalloc_test.c
+
+diff --git a/mm/Makefile b/mm/Makefile
+index 9175f8cc6565..184aa13e18a2 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -117,6 +117,7 @@ obj-$(CONFIG_DEBUG_VM_PGTABLE) += debug_vm_pgtable.o
+ obj-$(CONFIG_PAGE_OWNER) += page_owner.o
+ obj-$(CONFIG_MEMORY_ISOLATION) += page_isolation.o
+ obj-$(CONFIG_ZSMALLOC)	+= zsmalloc.o
++obj-m			+= zsmalloc_test.o
+ obj-$(CONFIG_GENERIC_EARLY_IOREMAP) += early_ioremap.o
+ obj-$(CONFIG_CMA)	+= cma.o
+ obj-$(CONFIG_NUMA) += numa.o
+diff --git a/mm/zsmalloc_test.c b/mm/zsmalloc_test.c
+new file mode 100644
+index 000000000000..bd0891ada4a4
+--- /dev/null
++++ b/mm/zsmalloc_test.c
+@@ -0,0 +1,164 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/zsmalloc.h>
++#include <linux/slab.h>
++#include <linux/mm.h>
++#include <linux/list.h>
++#include <linux/ktime.h>
++
++#define MIN_SIZE 32
++#define STEP_SIZE 16
++#define OBJS_PER_CLASS 1337
++#define ZS_HANDLE_SIZE sizeof(unsigned long)
++
++struct test_obj {
++	unsigned long handle;
++	size_t size;
++	struct list_head list;
++};
++
++static LIST_HEAD(handles_list);
++static struct zs_pool *pool;
++
++static void free_objects(void)
++{
++	struct test_obj *obj, *tmp;
++
++	list_for_each_entry_safe(obj, tmp, &handles_list, list) {
++		zs_free(pool, obj->handle);
++		list_del(&obj->list);
++		kfree(obj);
++	}
++}
++
++static int allocate_objects(void *local_copy)
++{
++	u64 total_alloc_size = 0;
++	struct test_obj *obj;
++	ktime_t start, end;
++	int count = 0;
++	int i, size;
++	s64 delta_us;
++	u32 ratio;
++
++	for (size = MIN_SIZE; size < PAGE_SIZE; size += STEP_SIZE) {
++		for (i = 0; i < OBJS_PER_CLASS; i++) {
++			unsigned long handle;
++
++			handle = zs_malloc(pool, size, GFP_KERNEL, 0);
++			if (!handle) {
++				pr_err("zs_malloc failed for size %d\n", size);
++				return -ENOMEM;
++			}
++
++			obj = kmalloc(sizeof(*obj), GFP_KERNEL);
++			if (!obj) {
++				zs_free(pool, handle);
++				return -ENOMEM;
++			}
++
++			total_alloc_size += size;
++			obj->handle = handle;
++			obj->size = size;
++			list_add_tail(&obj->list, &handles_list);
++
++			count++;
++		}
++	}
++
++	start = ktime_get();
++
++	list_for_each_entry(obj, &handles_list, list) {
++		zs_obj_write(pool, obj->handle, local_copy, obj->size);
++	}
++
++	end = ktime_get();
++	delta_us = ktime_to_us(ktime_sub(end, start));
++
++	pr_info("num write objects: %d\n", count);
++	pr_info("pool pages used %lu, total allocated size %llu\n",
++		zs_get_total_pages(pool), total_alloc_size);
++
++	ratio = total_alloc_size * 1000 / (zs_get_total_pages(pool) * PAGE_SIZE);
++	pr_info("pool memory utilization: %u.%u\n", ratio / 10, ratio % 10);
++	pr_info("all write() completed in %lld us\n", delta_us);
++
++	return 0;
++}
++
++static void run_read_test(void *local_copy)
++{
++	struct test_obj *obj;
++	void *mapped_addr;
++	int count = 0;
++	ktime_t start, end;
++	s64 delta_us;
++	u64 total_memcpy_size = 0;
++	u32 spans_count = 0;
++
++	start = ktime_get();
++
++	list_for_each_entry(obj, &handles_list, list) {
++		mapped_addr = zs_obj_read_begin(pool, obj->handle, local_copy);
++
++		if (mapped_addr == (local_copy + ZS_HANDLE_SIZE)) {
++			spans_count++;
++			total_memcpy_size += obj->size;
++		}
++
++		zs_obj_read_end(pool, obj->handle, mapped_addr);
++		count++;
++	}
++
++	end = ktime_get();
++	delta_us = ktime_to_us(ktime_sub(end, start));
++
++	pr_info("num read objects: %d\n", count);
++	pr_info("spanning objects: %u, total memcpy size: %llu\n", spans_count,
++		total_memcpy_size);
++	pr_info("all read() completed in %lld us\n", delta_us);
++}
++
++static int __init zsmalloc_test_init(void)
++{
++	void *local_copy;
++	int err;
++
++	pool = zs_create_pool("test_pool");
++	if (!pool)
++		return -ENOMEM;
++
++	local_copy = kmalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!local_copy) {
++		zs_destroy_pool(pool);
++		return -ENOMEM;
++	}
++	memset(local_copy, 0, PAGE_SIZE);
++
++	err = allocate_objects(local_copy);
++	if (err < 0)
++		goto cleanup;
++	
++	run_read_test(local_copy);
++
++cleanup:
++	free_objects();
++	kfree(local_copy);
++	zs_destroy_pool(pool);
++	return err;
++}
++
++static void __exit zsmalloc_test_exit(void)
++{
++	pr_info("module unloaded\n");
++}
++
++module_init(zsmalloc_test_init);
++module_exit(zsmalloc_test_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("zsmalloc test module");
+-- 
+2.52.0.351.gbe84eed79e-goog
+
