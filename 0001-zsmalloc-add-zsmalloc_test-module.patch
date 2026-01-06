@@ -1,4 +1,4 @@
-From 1a26b57590cd40dd3ff5ef851eb19c46bccecc8b Mon Sep 17 00:00:00 2001
+From 898425c21ead7f6fd6c9064d2753b95d4e625763 Mon Sep 17 00:00:00 2001
 From: Sergey Senozhatsky <senozhatsky@chromium.org>
 Date: Tue, 30 Dec 2025 21:19:42 +0900
 Subject: [PATCH] zsmalloc: add zsmalloc_test module
@@ -9,8 +9,8 @@ zsmalloc workloads.
 Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
 ---
  mm/Makefile        |   1 +
- mm/zsmalloc_test.c | 165 +++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 166 insertions(+)
+ mm/zsmalloc_test.c | 183 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 184 insertions(+)
  create mode 100644 mm/zsmalloc_test.c
 
 diff --git a/mm/Makefile b/mm/Makefile
@@ -27,10 +27,10 @@ index b1963ccc74ac..7509d6416d06 100644
  obj-$(CONFIG_NUMA) += numa.o
 diff --git a/mm/zsmalloc_test.c b/mm/zsmalloc_test.c
 new file mode 100644
-index 000000000000..ead40ffaf502
+index 000000000000..2f756c649d7c
 --- /dev/null
 +++ b/mm/zsmalloc_test.c
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,183 @@
 +// SPDX-License-Identifier: GPL-2.0
 +
 +#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -44,7 +44,9 @@ index 000000000000..ead40ffaf502
 +#include <linux/ktime.h>
 +
 +#define MIN_SIZE 32
-+#define STEP_SIZE 1
++#define MIN_STEP_SIZE 1
++#define MAX_STEP_SIZE 127
++#define STEP_DELTA 8
 +#define OBJS_PER_CLASS 182
 +#define ZS_HANDLE_SIZE sizeof(unsigned long)
 +
@@ -68,7 +70,7 @@ index 000000000000..ead40ffaf502
 +	}
 +}
 +
-+static int allocate_objects(void *local_copy)
++static int allocate_objects(void *local_copy, u32 step)
 +{
 +	u64 total_alloc_size = 0;
 +	struct test_obj *obj;
@@ -78,7 +80,7 @@ index 000000000000..ead40ffaf502
 +	s64 delta_us;
 +	u32 ratio;
 +
-+	for (sz = MIN_SIZE; sz < zs_huge_class_size(pool); sz += STEP_SIZE) {
++	for (sz = MIN_SIZE; sz < zs_huge_class_size(pool); sz += step) {
 +		for (i = 0; i < OBJS_PER_CLASS; i++) {
 +			unsigned long handle;
 +
@@ -157,7 +159,7 @@ index 000000000000..ead40ffaf502
 +	pr_info("all read() completed in %lld us\n", delta_us);
 +}
 +
-+static int __init zsmalloc_test_init(void)
++static int run(u32 step)
 +{
 +	void *local_copy;
 +	int err;
@@ -173,7 +175,7 @@ index 000000000000..ead40ffaf502
 +	}
 +	memset(local_copy, 0, PAGE_SIZE);
 +
-+	err = allocate_objects(local_copy);
++	err = allocate_objects(local_copy, step);
 +	if (err < 0)
 +		goto cleanup;
 +	
@@ -184,6 +186,22 @@ index 000000000000..ead40ffaf502
 +	kfree(local_copy);
 +	zs_destroy_pool(pool);
 +	return err;
++}
++
++static int __init zsmalloc_test_init(void)
++{
++	u32 step;
++	int err;
++
++	for (step = MIN_STEP_SIZE; step <= MAX_STEP_SIZE; step += STEP_DELTA) {
++		pr_info("running test with step size: %u\n", step);
++		err = run(step);
++		if (err < 0) {
++			pr_err("test failed with step size: %u\n", step);
++			return err;
++		}
++	}
++	return 0;
 +}
 +
 +static void __exit zsmalloc_test_exit(void)
