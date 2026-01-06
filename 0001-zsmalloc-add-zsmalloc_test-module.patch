@@ -1,4 +1,4 @@
-From 7554aed6aeb8509e49291e64d3d3193ddd88ba1c Mon Sep 17 00:00:00 2001
+From 1a26b57590cd40dd3ff5ef851eb19c46bccecc8b Mon Sep 17 00:00:00 2001
 From: Sergey Senozhatsky <senozhatsky@chromium.org>
 Date: Tue, 30 Dec 2025 21:19:42 +0900
 Subject: [PATCH] zsmalloc: add zsmalloc_test module
@@ -9,15 +9,15 @@ zsmalloc workloads.
 Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
 ---
  mm/Makefile        |   1 +
- mm/zsmalloc_test.c | 164 +++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 165 insertions(+)
+ mm/zsmalloc_test.c | 165 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 166 insertions(+)
  create mode 100644 mm/zsmalloc_test.c
 
 diff --git a/mm/Makefile b/mm/Makefile
-index 9175f8cc6565..2068548c9305 100644
+index b1963ccc74ac..7509d6416d06 100644
 --- a/mm/Makefile
 +++ b/mm/Makefile
-@@ -117,6 +117,7 @@ obj-$(CONFIG_DEBUG_VM_PGTABLE) += debug_vm_pgtable.o
+@@ -120,6 +120,7 @@ obj-$(CONFIG_DEBUG_VM_PGTABLE) += debug_vm_pgtable.o
  obj-$(CONFIG_PAGE_OWNER) += page_owner.o
  obj-$(CONFIG_MEMORY_ISOLATION) += page_isolation.o
  obj-$(CONFIG_ZSMALLOC)	+= zsmalloc.o
@@ -27,10 +27,10 @@ index 9175f8cc6565..2068548c9305 100644
  obj-$(CONFIG_NUMA) += numa.o
 diff --git a/mm/zsmalloc_test.c b/mm/zsmalloc_test.c
 new file mode 100644
-index 000000000000..0285c085c0e9
+index 000000000000..ead40ffaf502
 --- /dev/null
 +++ b/mm/zsmalloc_test.c
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,165 @@
 +// SPDX-License-Identifier: GPL-2.0
 +
 +#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -44,8 +44,8 @@ index 000000000000..0285c085c0e9
 +#include <linux/ktime.h>
 +
 +#define MIN_SIZE 32
-+#define STEP_SIZE 16
-+#define OBJS_PER_CLASS 1337
++#define STEP_SIZE 1
++#define OBJS_PER_CLASS 182
 +#define ZS_HANDLE_SIZE sizeof(unsigned long)
 +
 +struct test_obj {
@@ -136,14 +136,15 @@ index 000000000000..0285c085c0e9
 +	start = ktime_get();
 +
 +	list_for_each_entry(obj, &handles_list, list) {
-+		mapped_addr = zs_obj_read_begin(pool, obj->handle, local_copy);
++		mapped_addr = zs_obj_read_begin(pool, obj->handle,
++						obj->size, local_copy);
 +
 +		if (mapped_addr == (local_copy + ZS_HANDLE_SIZE)) {
 +			spans_count++;
 +			total_memcpy_size += obj->size;
 +		}
 +
-+		zs_obj_read_end(pool, obj->handle, mapped_addr);
++		zs_obj_read_end(pool, obj->handle, obj->size, mapped_addr);
 +		count++;
 +	}
 +
