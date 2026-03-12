@@ -1,0 +1,370 @@
+From f1d044543dc9f54275db4ea687e924a5253e2bd1 Mon Sep 17 00:00:00 2001
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Date: Thu, 12 Mar 2026 13:15:21 +0900
+Subject: [PATCH] GEMINI: zsmalloc: singleton pool test modules
+
+Co-developed-by: gemini 3.0
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+---
+ mm/Makefile        |   1 +
+ mm/zsmalloc_test.c | 336 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 337 insertions(+)
+ create mode 100644 mm/zsmalloc_test.c
+
+diff --git a/mm/Makefile b/mm/Makefile
+index 8ad2ab08244e..881183c0cacd 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -120,6 +120,7 @@ obj-$(CONFIG_DEBUG_VM_PGTABLE) += debug_vm_pgtable.o
+ obj-$(CONFIG_PAGE_OWNER) += page_owner.o
+ obj-$(CONFIG_MEMORY_ISOLATION) += page_isolation.o
+ obj-$(CONFIG_ZSMALLOC)	+= zsmalloc.o
++obj-$(CONFIG_ZSMALLOC)	+= zsmalloc_test.o
+ obj-$(CONFIG_GENERIC_EARLY_IOREMAP) += early_ioremap.o
+ obj-$(CONFIG_CMA)	+= cma.o
+ obj-$(CONFIG_NUMA) += numa.o
+diff --git a/mm/zsmalloc_test.c b/mm/zsmalloc_test.c
+new file mode 100644
+index 000000000000..3a6e72e4ee5a
+--- /dev/null
++++ b/mm/zsmalloc_test.c
+@@ -0,0 +1,336 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/zsmalloc.h>
++#include <linux/slab.h>
++#include <linux/kthread.h>
++#include <linux/prandom.h>
++#include <linux/jiffies.h>
++#include <linux/list.h>
++#include <linux/completion.h>
++#include <linux/ktime.h>
++
++static int num_threads = 24;
++module_param(num_threads, int, 0444);
++
++static int num_ops = 314 * 271 * 11;
++module_param(num_ops, int, 0444);
++
++static int num_pools = 0;
++module_param(num_pools, int, 0444);
++
++struct test_pool_data {
++	struct zs_pool *pool;
++	atomic_long_t alloc_bytes;
++	atomic_long_t max_pages;
++	atomic_long_t frag_at_max_pages;
++	atomic_long_t sum_frag;
++	atomic_long_t num_samples;
++};
++
++static struct test_pool_data *all_pools;
++static int num_test_pools;
++static atomic_long_t global_max_pages;
++static atomic_long_t global_frag_at_max_pages;
++static atomic_long_t global_sum_frag;
++static atomic_long_t global_num_samples;
++
++struct test_thread_data {
++	int id;
++	struct test_pool_data *tpd;
++	struct task_struct *task;
++	u64 start_ns;
++	u64 end_ns;
++	unsigned long start_jiffies;
++	unsigned long end_jiffies;
++	int err;
++	struct completion done;
++};
++
++struct handle_node {
++	unsigned long handle;
++	size_t size;
++	struct list_head list;
++};
++
++static void update_global_stats(int op_idx)
++{
++	unsigned long pages = 0;
++	unsigned long bytes = 0;
++	unsigned long frag = 0;
++	unsigned long old_max, prev;
++	int i;
++
++	for (i = 0; i < num_test_pools; i++) {
++		pages += zs_get_total_pages(all_pools[i].pool);
++		bytes += atomic_long_read(&all_pools[i].alloc_bytes);
++	}
++
++	if (pages > 0) {
++		unsigned long total_size = pages * PAGE_SIZE;
++		if (total_size > bytes)
++			frag = ((total_size - bytes) * 1000) / total_size;
++	}
++
++	/* Skip first 10% of ops to ignore startup spikes in the average */
++	if (op_idx > num_ops / 10) {
++		atomic_long_add(frag, &global_sum_frag);
++		atomic_long_inc(&global_num_samples);
++	}
++
++	old_max = atomic_long_read(&global_max_pages);
++	while (pages > old_max) {
++		prev = atomic_long_cmpxchg(&global_max_pages, old_max, pages);
++		if (prev == old_max) {
++			atomic_long_set(&global_frag_at_max_pages, frag);
++			break;
++		}
++		old_max = prev;
++	}
++}
++
++static void update_pool_stats(struct test_pool_data *tpd, int op_idx)
++{
++	unsigned long pages = zs_get_total_pages(tpd->pool);
++	unsigned long bytes = atomic_long_read(&tpd->alloc_bytes);
++	unsigned long frag = 0;
++	unsigned long old_max, prev;
++
++	if (pages > 0) {
++		unsigned long total_size = pages * PAGE_SIZE;
++		if (total_size > bytes)
++			frag = ((total_size - bytes) * 1000) / total_size;
++	}
++
++	if (op_idx > num_ops / 10) {
++		atomic_long_add(frag, &tpd->sum_frag);
++		atomic_long_inc(&tpd->num_samples);
++	}
++
++	old_max = atomic_long_read(&tpd->max_pages);
++	while (pages > old_max) {
++		prev = atomic_long_cmpxchg(&tpd->max_pages, old_max, pages);
++		if (prev == old_max) {
++			atomic_long_set(&tpd->frag_at_max_pages, frag);
++			break;
++		}
++		old_max = prev;
++	}
++}
++
++static int zsmalloc_test_thread(void *data)
++{
++	struct test_thread_data *td = data;
++	struct test_pool_data *tpd = td->tpd;
++	struct rnd_state state;
++	LIST_HEAD(handles);
++	int i;
++	void *local_copy;
++	size_t max_sz;
++
++	local_copy = kmalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!local_copy) {
++		td->err = -ENOMEM;
++		goto out;
++	}
++
++	max_sz = zs_huge_class_size(tpd->pool);
++	prandom_seed_state(&state, td->id + 0x12345678);
++
++	td->start_ns = ktime_get_ns();
++	td->start_jiffies = jiffies;
++
++	for (i = 0; i < num_ops; i++) {
++		int op = prandom_u32_state(&state) % 100;
++		/* 60% alloc in first half, 40% alloc in second half to create a curve */
++		int alloc_threshold = (i < num_ops / 2) ? 60 : 40;
++
++		if (op < alloc_threshold) {
++			size_t size = (prandom_u32_state(&state) % (max_sz - 32)) + 32;
++			unsigned long h = zs_malloc(tpd->pool, size, GFP_KERNEL, 0);
++
++			if (h) {
++				struct handle_node *node = kmalloc(sizeof(*node), GFP_KERNEL);
++
++				if (node) {
++					void *addr;
++
++					node->handle = h;
++					node->size = size;
++					list_add_tail(&node->list, &handles);
++
++					atomic_long_add(size, &tpd->alloc_bytes);
++					update_pool_stats(tpd, i);
++					update_global_stats(i);
++
++					/* map/unmap */
++					addr = zs_obj_read_begin(tpd->pool, h, size, local_copy);
++					zs_obj_read_end(tpd->pool, h, size, addr);
++				} else {
++					zs_free(tpd->pool, h);
++				}
++			}
++		} else if (!list_empty(&handles)) {
++			struct handle_node *node;
++
++			node = list_first_entry(&handles, struct handle_node, list);
++			zs_free(tpd->pool, node->handle);
++			atomic_long_sub(node->size, &tpd->alloc_bytes);
++			update_pool_stats(tpd, i);
++			update_global_stats(i);
++			list_del(&node->list);
++			kfree(node);
++		}
++	}
++
++	/* Cleanup any remaining objects */
++	while (!list_empty(&handles)) {
++		struct handle_node *node = list_first_entry(&handles, struct handle_node, list);
++
++		zs_free(tpd->pool, node->handle);
++		atomic_long_sub(node->size, &tpd->alloc_bytes);
++		update_pool_stats(tpd, num_ops);
++		update_global_stats(num_ops);
++		list_del(&node->list);
++		kfree(node);
++	}
++
++	td->end_jiffies = jiffies;
++	td->end_ns = ktime_get_ns();
++	kfree(local_copy);
++out:
++	complete(&td->done);
++	return 0;
++}
++
++static int __init zsmalloc_test_init(void)
++{
++	struct test_thread_data *threads;
++	struct test_pool_data *pools;
++	int i, err = 0;
++	u64 max_duration_ns = 0;
++	unsigned long max_duration_jiffies = 0;
++
++	if (num_pools <= 0)
++		num_pools = num_threads;
++	if (num_pools > num_threads)
++		num_pools = num_threads;
++
++	pr_info("Starting test: threads=%d, ops=%d, num_pools=%d\n",
++		num_threads, num_ops, num_pools);
++
++	atomic_long_set(&global_max_pages, 0);
++	atomic_long_set(&global_frag_at_max_pages, 0);
++	atomic_long_set(&global_sum_frag, 0);
++	atomic_long_set(&global_num_samples, 0);
++
++	pools = kcalloc(num_pools, sizeof(*pools), GFP_KERNEL);
++	if (!pools)
++		return -ENOMEM;
++
++	all_pools = pools;
++	num_test_pools = num_pools;
++
++	for (i = 0; i < num_pools; i++) {
++		char name[32];
++		snprintf(name, sizeof(name), "test_pool_%d", i);
++		pools[i].pool = zs_create_pool(name);
++		if (!pools[i].pool) {
++			err = -ENOMEM;
++			goto cleanup_pools;
++		}
++		atomic_long_set(&pools[i].alloc_bytes, 0);
++		atomic_long_set(&pools[i].max_pages, 0);
++		atomic_long_set(&pools[i].frag_at_max_pages, 0);
++		atomic_long_set(&pools[i].sum_frag, 0);
++		atomic_long_set(&pools[i].num_samples, 0);
++	}
++
++	threads = kcalloc(num_threads, sizeof(*threads), GFP_KERNEL);
++	if (!threads) {
++		err = -ENOMEM;
++		goto cleanup_pools;
++	}
++
++	for (i = 0; i < num_threads; i++) {
++		threads[i].id = i;
++		threads[i].tpd = &pools[i % num_pools];
++		init_completion(&threads[i].done);
++
++		threads[i].task = kthread_run(zsmalloc_test_thread, &threads[i],
++					      "zs_test/%d", i);
++		if (IS_ERR(threads[i].task)) {
++			err = PTR_ERR(threads[i].task);
++			break;
++		}
++	}
++
++	/* Wait for all started threads */
++	for (i = 0; i < num_threads; i++) {
++		if (threads[i].task && !IS_ERR(threads[i].task))
++			wait_for_completion(&threads[i].done);
++
++		if (threads[i].end_ns > threads[i].start_ns) {
++			u64 dur = threads[i].end_ns - threads[i].start_ns;
++			if (dur > max_duration_ns)
++				max_duration_ns = dur;
++		}
++
++		if (threads[i].end_jiffies > threads[i].start_jiffies) {
++			unsigned long dur = threads[i].end_jiffies - threads[i].start_jiffies;
++			if (dur > max_duration_jiffies)
++				max_duration_jiffies = dur;
++		}
++	}
++
++	for (i = 0; i < num_pools; i++) {
++		unsigned long max_p = atomic_long_read(&pools[i].max_pages);
++		unsigned long frag_at_peak = atomic_long_read(&pools[i].frag_at_max_pages);
++		unsigned long sum_f = atomic_long_read(&pools[i].sum_frag);
++		unsigned long n_samples = atomic_long_read(&pools[i].num_samples);
++		unsigned long mean_f = n_samples ? (sum_f / n_samples) : 0;
++
++		pr_info("Pool %d stats: max_pages=%lu, frag_at_peak=%lu.%lu%%, mean_frag=%lu.%lu%%\n",
++			i, max_p, frag_at_peak / 10, frag_at_peak % 10,
++			mean_f / 10, mean_f % 10);
++	}
++
++	{
++		unsigned long g_max_p = atomic_long_read(&global_max_pages);
++		unsigned long g_frag_at_peak = atomic_long_read(&global_frag_at_max_pages);
++		unsigned long g_sum_f = atomic_long_read(&global_sum_frag);
++		unsigned long g_n_samples = atomic_long_read(&global_num_samples);
++		unsigned long g_mean_f = g_n_samples ? (g_sum_f / g_n_samples) : 0;
++
++		pr_info("Global stats: max_pages=%lu, frag_at_peak=%lu.%lu%%, mean_frag=%lu.%lu%%\n",
++			g_max_p, g_frag_at_peak / 10, g_frag_at_peak % 10,
++			g_mean_f / 10, g_mean_f % 10);
++	}
++
++	pr_info("Max thread duration: %llu ns (%lu jiffies)\n",
++		max_duration_ns, max_duration_jiffies);
++
++	kfree(threads);
++cleanup_pools:
++	for (i = 0; i < num_pools; i++) {
++		if (pools[i].pool)
++			zs_destroy_pool(pools[i].pool);
++	}
++	kfree(pools);
++
++	return err;
++}
++
++static void __exit zsmalloc_test_exit(void)
++{
++	pr_info("Module unloaded\n");
++}
++
++module_init(zsmalloc_test_init);
++module_exit(zsmalloc_test_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("zsmalloc singleton pool test module");
+-- 
+2.53.0.473.g4a7958ca14-goog
+
