@@ -1,0 +1,554 @@
+From 635f5ea46430db36c0044796ac1087ab64b4ef79 Mon Sep 17 00:00:00 2001
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Date: Thu, 12 Mar 2026 13:29:00 +0900
+Subject: [PATCH] CLAUDE: zsmalloc: singleton pool test modules
+
+Co-developed-by: claude 4.6
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+---
+ mm/Makefile        |   1 +
+ mm/zsmalloc_test.c | 520 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 521 insertions(+)
+ create mode 100644 mm/zsmalloc_test.c
+
+diff --git a/mm/Makefile b/mm/Makefile
+index ffd06cf7a04e..37f1b1db6605 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -120,6 +120,7 @@ obj-$(CONFIG_DEBUG_VM_PGTABLE) += debug_vm_pgtable.o
+ obj-$(CONFIG_PAGE_OWNER) += page_owner.o
+ obj-$(CONFIG_MEMORY_ISOLATION) += page_isolation.o
+ obj-$(CONFIG_ZSMALLOC)	+= zsmalloc.o
++obj-$(CONFIG_ZSMALLOC)	+= zsmalloc_test.o
+ obj-$(CONFIG_GENERIC_EARLY_IOREMAP) += early_ioremap.o
+ obj-$(CONFIG_CMA)	+= cma.o
+ obj-$(CONFIG_NUMA) += numa.o
+diff --git a/mm/zsmalloc_test.c b/mm/zsmalloc_test.c
+new file mode 100644
+index 000000000000..252e16040b14
+--- /dev/null
++++ b/mm/zsmalloc_test.c
+@@ -0,0 +1,520 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * zsmalloc concurrent stress test
++ *
++ * Creates multiple kernel threads that concurrently perform a
++ * randomised mix of alloc / map+unmap / free operations on zsmalloc
++ * objects.  The number of pools is configurable:
++ *
++ *   num_pools=0 (default) -- per-thread pools (no pool-level contention)
++ *   num_pools=1           -- one shared pool (maximum contention)
++ *   num_pools=N           -- N pools shared round-robin among threads
++ *
++ * All workloads are deterministic (seeded PRNG) so results are
++ * byte-for-byte reproducible across runs with the same parameters.
++ *
++ * Useful for measuring:
++ *   - Lock contention  (enable CONFIG_LOCK_STAT, read /proc/lock_stat)
++ *   - Throughput        (per-op ktime reported via pr_info)
++ *   - Memory efficiency (pool page count reported at peak)
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/kthread.h>
++#include <linux/zsmalloc.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/mm.h>
++#include <linux/ktime.h>
++#include <linux/completion.h>
++#include <linux/atomic.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
++
++/*
++ * Module parameters -- every knob needed to reproduce a workload.
++ */
++static unsigned int num_threads = 24;
++module_param(num_threads, uint, 0444);
++MODULE_PARM_DESC(num_threads, "Number of concurrent threads (default: 24)");
++
++static unsigned int num_objs = 1024 * 1024;
++module_param(num_objs, uint, 0444);
++MODULE_PARM_DESC(num_objs,
++	"Max live objects per thread / working set (default: 1048576)");
++
++static unsigned int num_ops = 314 * 271 * 11;
++module_param(num_ops, uint, 0444);
++MODULE_PARM_DESC(num_ops,
++	"Total mixed ops per thread (default: 936034)");
++
++static unsigned int obj_min_size = 32;
++module_param(obj_min_size, uint, 0444);
++MODULE_PARM_DESC(obj_min_size, "Minimum object size in bytes (default: 32)");
++
++static unsigned int obj_max_size;
++module_param(obj_max_size, uint, 0444);
++MODULE_PARM_DESC(obj_max_size,
++	"Maximum object size in bytes (default: 0 = huge_class_size - 1)");
++
++static unsigned int base_seed = 12345;
++module_param(base_seed, uint, 0444);
++MODULE_PARM_DESC(base_seed,
++	"Base PRNG seed for reproducibility (default: 12345)");
++
++static unsigned int num_pools;
++module_param(num_pools, uint, 0444);
++MODULE_PARM_DESC(num_pools,
++	"Number of zs_pools (default: 0 = num_threads, i.e. per-thread pools)");
++
++/*
++ * xorshift32 -- fast, deterministic PRNG.  Same seed always produces
++ * the same sequence.  State must be non-zero.
++ */
++static u32 xorshift32(u32 *state)
++{
++	u32 x = *state;
++
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	*state = x;
++	return x;
++}
++
++static size_t rand_obj_size(u32 *rng, size_t min_sz, size_t max_sz)
++{
++	return min_sz + (xorshift32(rng) % (max_sz - min_sz + 1));
++}
++
++enum op_type {
++	OP_ALLOC,
++	OP_MAP,
++	OP_FREE,
++	NR_OPS,
++};
++
++static const char * const op_names[NR_OPS] = {
++	[OP_ALLOC] = "alloc",
++	[OP_MAP]   = "map",
++	[OP_FREE]  = "free",
++};
++
++struct thread_ctx {
++	int			id;
++	struct task_struct	*task;
++	struct completion	done;
++
++	struct zs_pool		*pool;
++
++	/*
++	 * handles[0..nr_live-1] are currently allocated.
++	 * sizes[] stores the corresponding object sizes.
++	 */
++	unsigned long		*handles;
++	size_t			*sizes;
++	unsigned int		nr_live;
++	size_t			live_bytes;
++	void			*local_buf;
++
++	/* Per-op counters and cumulative time (us) */
++	unsigned int		op_count[NR_OPS];
++	s64			elapsed_us[NR_OPS];
++	s64			total_elapsed_us;
++
++	int			err;
++};
++
++static struct thread_ctx *threads;
++static struct zs_pool **pools;
++static unsigned int eff_num_pools;
++static size_t eff_max_size;
++
++/*
++ * Barrier -- generation-counter based.  All num_threads threads must
++ * arrive before any is released.  Safe for back-to-back reuse.
++ */
++static atomic_t barrier_count;
++static atomic_t barrier_gen;
++static DECLARE_WAIT_QUEUE_HEAD(barrier_wq);
++
++static void thread_barrier(void)
++{
++	int gen = atomic_read(&barrier_gen);
++
++	if (atomic_inc_return(&barrier_count) == num_threads) {
++		atomic_set(&barrier_count, 0);
++		smp_mb__before_atomic();
++		atomic_inc(&barrier_gen);
++		wake_up_all(&barrier_wq);
++	} else {
++		wait_event(barrier_wq, atomic_read(&barrier_gen) != gen);
++	}
++}
++
++/* ---- individual operations ---- */
++
++static void op_alloc(struct thread_ctx *ctx, u32 *rng)
++{
++	struct zs_pool *pool = ctx->pool;
++	size_t sz = rand_obj_size(rng, obj_min_size, eff_max_size);
++	unsigned long handle;
++	ktime_t start;
++
++	start = ktime_get();
++	handle = zs_malloc(pool, sz, GFP_KERNEL, NUMA_NO_NODE);
++	ctx->elapsed_us[OP_ALLOC] += ktime_us_delta(ktime_get(), start);
++
++	if (!handle) {
++		pr_err("thread %d: zs_malloc failed size %zu\n",
++		       ctx->id, sz);
++		ctx->err = -ENOMEM;
++		return;
++	}
++
++	ctx->handles[ctx->nr_live] = handle;
++	ctx->sizes[ctx->nr_live] = sz;
++	ctx->nr_live++;
++	ctx->live_bytes += sz;
++	ctx->op_count[OP_ALLOC]++;
++}
++
++static void op_map(struct thread_ctx *ctx, u32 *rng)
++{
++	struct zs_pool *pool = ctx->pool;
++	unsigned int idx = xorshift32(rng) % ctx->nr_live;
++	ktime_t start;
++	void *addr;
++
++	start = ktime_get();
++	addr = zs_obj_read_begin(pool, ctx->handles[idx],
++				 ctx->sizes[idx], ctx->local_buf);
++	zs_obj_read_end(pool, ctx->handles[idx],
++			ctx->sizes[idx], addr);
++	ctx->elapsed_us[OP_MAP] += ktime_us_delta(ktime_get(), start);
++	ctx->op_count[OP_MAP]++;
++}
++
++static void op_free(struct thread_ctx *ctx, u32 *rng)
++{
++	struct zs_pool *pool = ctx->pool;
++	unsigned int idx = xorshift32(rng) % ctx->nr_live;
++	ktime_t start;
++
++	start = ktime_get();
++	zs_free(pool, ctx->handles[idx]);
++	ctx->elapsed_us[OP_FREE] += ktime_us_delta(ktime_get(), start);
++
++	ctx->live_bytes -= ctx->sizes[idx];
++
++	/* Swap-remove to keep the live array packed */
++	ctx->nr_live--;
++	ctx->handles[idx] = ctx->handles[ctx->nr_live];
++	ctx->sizes[idx] = ctx->sizes[ctx->nr_live];
++	ctx->op_count[OP_FREE]++;
++}
++
++static void drain_all(struct thread_ctx *ctx)
++{
++	struct zs_pool *pool = ctx->pool;
++
++	while (ctx->nr_live) {
++		ctx->nr_live--;
++		zs_free(pool, ctx->handles[ctx->nr_live]);
++	}
++	ctx->live_bytes = 0;
++}
++
++/* ---- mixed-ops workload ---- */
++
++static void run_mixed_ops(struct thread_ctx *ctx, u32 *rng)
++{
++	ktime_t start = ktime_get();
++	unsigned int i;
++
++	for (i = 0; i < num_ops; i++) {
++		u32 r = xorshift32(rng) % 3;
++
++		if (ctx->nr_live == 0)
++			r = 0;			/* must alloc */
++		else if (ctx->nr_live >= num_objs)
++			r = (r == 0) ? 1 : r;	/* cannot alloc */
++
++		switch (r) {
++		case 0:
++			op_alloc(ctx, rng);
++			break;
++		case 1:
++			op_map(ctx, rng);
++			break;
++		case 2:
++			op_free(ctx, rng);
++			break;
++		}
++
++		if (ctx->err)
++			break;
++	}
++
++	ctx->total_elapsed_us = ktime_us_delta(ktime_get(), start);
++}
++
++/* ---- pool stats snapshot ---- */
++
++static void snapshot_pool_stats(void)
++{
++	unsigned long total_pages = 0;
++	unsigned long total_compacted = 0;
++	size_t total_live_bytes = 0;
++	unsigned long pool_bytes;
++	unsigned int i;
++	u32 ratio;
++
++	for (i = 0; i < num_threads; i++)
++		total_live_bytes += threads[i].live_bytes;
++
++	for (i = 0; i < eff_num_pools; i++) {
++		struct zs_pool_stats pstats;
++
++		total_pages += zs_get_total_pages(pools[i]);
++		zs_pool_stats(pools[i], &pstats);
++		total_compacted += atomic_long_read(&pstats.pages_compacted);
++	}
++
++	pool_bytes = total_pages * PAGE_SIZE;
++	ratio = pool_bytes ? (unsigned int)(total_live_bytes * 1000 / pool_bytes) : 0;
++
++	pr_info("pool_pages %lu (%lu kb)  live_bytes %zu (%zu kb)  "
++		"utilization %u.%u%%  compacted %lu  (pools: %u)\n",
++		total_pages, total_pages * (PAGE_SIZE / 1024),
++		total_live_bytes, total_live_bytes / 1024,
++		ratio / 10, ratio % 10,
++		total_compacted,
++		eff_num_pools);
++}
++
++/* ---- thread entry point ---- */
++
++static int thread_fn(void *data)
++{
++	struct thread_ctx *ctx = data;
++	u32 rng;
++
++	ctx->handles   = vzalloc(array_size(num_objs, sizeof(*ctx->handles)));
++	ctx->sizes     = vzalloc(array_size(num_objs, sizeof(*ctx->sizes)));
++	ctx->local_buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
++
++	if (!ctx->handles || !ctx->sizes || !ctx->local_buf)
++		ctx->err = -ENOMEM;
++
++	rng = (base_seed ^ (ctx->id + 1)) | 1;
++
++	/* All threads start together */
++	thread_barrier();
++
++	if (!ctx->err)
++		run_mixed_ops(ctx, &rng);
++
++	/* Sync before stats snapshot */
++	thread_barrier();
++	if (ctx->id == 0)
++		snapshot_pool_stats();
++
++	/* Drain remaining live objects */
++	thread_barrier();
++	drain_all(ctx);
++
++	kfree(ctx->local_buf);
++	vfree(ctx->sizes);
++	vfree(ctx->handles);
++
++	complete(&ctx->done);
++
++	for (;;) {
++		set_current_state(TASK_INTERRUPTIBLE);
++		if (kthread_should_stop())
++			break;
++		schedule();
++	}
++	__set_current_state(TASK_RUNNING);
++
++	return ctx->err;
++}
++
++/* ---- results reporting ---- */
++
++static void print_results(void)
++{
++	s64 totals[NR_OPS] = {};
++	unsigned int cnt_totals[NR_OPS] = {};
++	s64 wall_total = 0;
++	unsigned int i, p;
++
++	pr_info("--- per-thread results (us) ---\n");
++
++	for (i = 0; i < num_threads; i++) {
++		struct thread_ctx *ctx = &threads[i];
++
++		if (ctx->err) {
++			pr_info("  thread %2u: ERROR %d\n", i, ctx->err);
++			continue;
++		}
++
++		pr_info("  thread %2u: alloc %7u/%10lld us  map %7u/%10lld us  free %7u/%10lld us  wall %10lld us\n",
++			i,
++			ctx->op_count[OP_ALLOC], ctx->elapsed_us[OP_ALLOC],
++			ctx->op_count[OP_MAP],   ctx->elapsed_us[OP_MAP],
++			ctx->op_count[OP_FREE],  ctx->elapsed_us[OP_FREE],
++			ctx->total_elapsed_us);
++
++		for (p = 0; p < NR_OPS; p++) {
++			totals[p] += ctx->elapsed_us[p];
++			cnt_totals[p] += ctx->op_count[p];
++		}
++		wall_total += ctx->total_elapsed_us;
++	}
++
++	pr_info("--- aggregate (us) ---\n");
++	for (p = 0; p < NR_OPS; p++)
++		pr_info("  %-5s  count %8u  total %12lld  avg %10lld\n",
++			op_names[p], cnt_totals[p], totals[p],
++			cnt_totals[p] ? totals[p] / cnt_totals[p] : 0);
++	pr_info("  wall   total %12lld  avg %10lld\n",
++		wall_total, num_threads ? wall_total / num_threads : 0);
++}
++
++/* ---- pool creation / destruction helpers ---- */
++
++static int create_pools(void)
++{
++	char name[32];
++	unsigned int i;
++
++	pools = kcalloc(eff_num_pools, sizeof(*pools), GFP_KERNEL);
++	if (!pools)
++		return -ENOMEM;
++
++	for (i = 0; i < eff_num_pools; i++) {
++		snprintf(name, sizeof(name), "zsmalloc_test_%u", i);
++		pools[i] = zs_create_pool(name);
++		if (!pools[i]) {
++			while (i--)
++				zs_destroy_pool(pools[i]);
++			kfree(pools);
++			pools = NULL;
++			return -ENOMEM;
++		}
++	}
++
++	/* Round-robin assignment: thread i → pool i % eff_num_pools */
++	for (i = 0; i < num_threads; i++)
++		threads[i].pool = pools[i % eff_num_pools];
++
++	return 0;
++}
++
++static void destroy_pools(void)
++{
++	unsigned int i;
++
++	if (!pools)
++		return;
++
++	for (i = 0; i < eff_num_pools; i++)
++		zs_destroy_pool(pools[i]);
++
++	kfree(pools);
++	pools = NULL;
++}
++
++/* ---- module init / exit ---- */
++
++static int __init zsmalloc_test_init(void)
++{
++	unsigned int i;
++	int err = 0;
++
++	if (!num_threads || !num_objs || !num_ops) {
++		pr_err("invalid parameters (all must be > 0)\n");
++		return -EINVAL;
++	}
++
++	/* 0 means per-thread pools; clamp to num_threads */
++	eff_num_pools = num_pools ? min(num_pools, num_threads) : num_threads;
++
++	threads = kcalloc(num_threads, sizeof(*threads), GFP_KERNEL);
++	if (!threads)
++		return -ENOMEM;
++
++	err = create_pools();
++	if (err)
++		goto out_threads;
++
++	eff_max_size = obj_max_size ? obj_max_size
++				    : zs_huge_class_size(threads[0].pool) - 1;
++
++	if (obj_min_size < 1 || obj_min_size > eff_max_size) {
++		pr_err("invalid size range [%u, %zu]\n",
++		       obj_min_size, eff_max_size);
++		err = -EINVAL;
++		goto out_pools;
++	}
++
++	pr_info("config: threads=%u pools=%u objs=%u ops=%u sizes=[%u,%zu] seed=%u\n",
++		num_threads, eff_num_pools, num_objs, num_ops,
++		obj_min_size, eff_max_size, base_seed);
++
++	for (i = 0; i < num_threads; i++) {
++		struct thread_ctx *ctx = &threads[i];
++
++		ctx->id = i;
++		init_completion(&ctx->done);
++
++		ctx->task = kthread_create(thread_fn, ctx, "zs_test/%u", i);
++		if (IS_ERR(ctx->task)) {
++			pr_err("failed to create thread %u\n", i);
++			err = PTR_ERR(ctx->task);
++			ctx->task = NULL;
++			while (i--)
++				kthread_stop(threads[i].task);
++			goto out_pools;
++		}
++	}
++
++	for (i = 0; i < num_threads; i++)
++		wake_up_process(threads[i].task);
++
++	for (i = 0; i < num_threads; i++)
++		wait_for_completion(&threads[i].done);
++
++	print_results();
++
++	for (i = 0; i < num_threads; i++) {
++		if (threads[i].err && !err)
++			err = threads[i].err;
++	}
++
++	for (i = 0; i < num_threads; i++)
++		kthread_stop(threads[i].task);
++
++out_pools:
++	destroy_pools();
++out_threads:
++	kfree(threads);
++	return err;
++}
++
++static void __exit zsmalloc_test_exit(void)
++{
++	pr_info("module unloaded\n");
++}
++
++module_init(zsmalloc_test_init);
++module_exit(zsmalloc_test_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("zsmalloc concurrent stress test");
+-- 
+2.53.0.473.g4a7958ca14-goog
+
